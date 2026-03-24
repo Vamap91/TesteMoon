@@ -333,238 +333,257 @@ def inferir_severidade(peca: str, tipo_dano: str, descricao: str) -> tuple[str, 
     return "Média", "badge-media"
 
 
-def desenhar_marcador_ponto(pil_image: Image.Image, pontos: list) -> Image.Image:
-    """
-    Desenha marcadores de precisão (crosshair + círculos pulsantes) nos pontos
-    exatos do dano retornados pelo endpoint /point do Moondream.
+# Paleta de cores para múltiplos marcadores — uma cor por peça danificada
+CORES_MARCADORES = [
+    (239, 68,  68),   # vermelho
+    (59,  130, 246),  # azul
+    (34,  197, 94),   # verde
+    (251, 191, 36),   # amarelo
+    (168, 85,  247),  # roxo
+    (20,  184, 166),  # teal
+]
 
-    Coordenadas normalizadas 0–1 → convertidas para pixels.
+
+def desenhar_marcadores_multi(
+    pil_image: Image.Image,
+    pecas_danificadas: list,          # lista de dicts com "label", "pontos", "bboxes", "cor"
+) -> Image.Image:
     """
-    img = pil_image.copy().convert("RGBA")
+    Desenha marcadores de precisão para MÚLTIPLAS peças danificadas.
+    Cada peça recebe uma cor diferente com label identificando qual é.
+
+    pecas_danificadas: [
+        {"label": "bumper", "pontos": [{"x":0.5,"y":0.7}], "bboxes": [], "cor": (R,G,B)},
+        ...
+    ]
+    """
+    img     = pil_image.copy().convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    draw    = ImageDraw.Draw(overlay)
 
-    w, h = pil_image.size
-    # Tamanho do marcador proporcional à imagem
-    raio_base = max(18, min(w, h) // 30)
+    w, h      = pil_image.size
+    raio_base = max(16, min(w, h) // 32)
 
-    for ponto in pontos:
-        cx = int(ponto["x"] * w)
-        cy = int(ponto["y"] * h)
+    for peca in pecas_danificadas:
+        cor   = peca.get("cor", (239, 68, 68))
+        label = peca.get("label", "dano")
+        r, g, b = cor
 
-        # ── Círculo externo (halo) ──────────────────────────────────────────
-        r_ext = raio_base * 3
-        draw.ellipse(
-            [cx - r_ext, cy - r_ext, cx + r_ext, cy + r_ext],
-            outline=(239, 68, 68, 60),
-            width=2,
-        )
+        # ── Desenha por pontos (/point) ──────────────────────────────────────
+        for ponto in peca.get("pontos", []):
+            cx = int(ponto["x"] * w)
+            cy = int(ponto["y"] * h)
+            _desenhar_crosshair(draw, cx, cy, raio_base, r, g, b, label)
 
-        # ── Círculo médio ───────────────────────────────────────────────────
-        r_mid = raio_base * 2
-        draw.ellipse(
-            [cx - r_mid, cy - r_mid, cx + r_mid, cy + r_mid],
-            outline=(239, 68, 68, 140),
-            width=2,
-        )
-
-        # ── Círculo interno preenchido ──────────────────────────────────────
-        r_inn = raio_base
-        draw.ellipse(
-            [cx - r_inn, cy - r_inn, cx + r_inn, cy + r_inn],
-            fill=(239, 68, 68, 200),
-            outline=(255, 255, 255, 230),
-            width=2,
-        )
-
-        # ── Crosshair (cruz) ────────────────────────────────────────────────
-        arm = raio_base * 4
-        gap = raio_base + 4  # gap entre centro e início do traço
-
-        # Horizontal
-        draw.line([cx - arm, cy, cx - gap, cy], fill=(239, 68, 68, 220), width=2)
-        draw.line([cx + gap, cy, cx + arm, cy], fill=(239, 68, 68, 220), width=2)
-        # Vertical
-        draw.line([cx, cy - arm, cx, cy - gap], fill=(239, 68, 68, 220), width=2)
-        draw.line([cx, cy + gap, cx, cy + arm], fill=(239, 68, 68, 220), width=2)
-
-        # ── Ponto central branco ────────────────────────────────────────────
-        dot = 3
-        draw.ellipse(
-            [cx - dot, cy - dot, cx + dot, cy + dot],
-            fill=(255, 255, 255, 255),
-        )
+        # ── Fallback: bounding boxes (/detect) ───────────────────────────────
+        for box in peca.get("bboxes", []):
+            x0 = int(box["x_min"] * w)
+            y0 = int(box["y_min"] * h)
+            x1 = int(box["x_max"] * w)
+            y1 = int(box["y_max"] * h)
+            draw.rectangle([x0, y0, x1, y1], fill=(r, g, b, 20))
+            draw.rectangle([x0, y0, x1, y1], outline=(r, g, b, 200), width=3)
+            # Ponto central na box
+            cx = (x0 + x1) // 2
+            cy = (y0 + y1) // 2
+            _desenhar_crosshair(draw, cx, cy, raio_base, r, g, b, label)
 
     resultado = Image.alpha_composite(img, overlay)
     return resultado.convert("RGB")
 
 
-def desenhar_bounding_boxes(pil_image: Image.Image, boxes: list) -> Image.Image:
-    """
-    Fallback: desenha bounding boxes quando /point não retorna coordenadas.
-    Também desenha o ponto central dentro de cada box.
-    """
-    img = pil_image.copy().convert("RGBA")
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+def _desenhar_crosshair(draw, cx, cy, raio_base, r, g, b, label=""):
+    """Desenha crosshair + halo + label para um único ponto."""
+    # Halo externo
+    r_ext = raio_base * 3
+    draw.ellipse([cx-r_ext, cy-r_ext, cx+r_ext, cy+r_ext],
+                 outline=(r, g, b, 55), width=2)
+    # Círculo médio
+    r_mid = raio_base * 2
+    draw.ellipse([cx-r_mid, cy-r_mid, cx+r_mid, cy+r_mid],
+                 outline=(r, g, b, 130), width=2)
+    # Círculo interno preenchido
+    draw.ellipse([cx-raio_base, cy-raio_base, cx+raio_base, cy+raio_base],
+                 fill=(r, g, b, 190), outline=(255, 255, 255, 230), width=2)
+    # Crosshair
+    arm = raio_base * 4
+    gap = raio_base + 4
+    draw.line([cx-arm, cy, cx-gap, cy], fill=(r, g, b, 210), width=2)
+    draw.line([cx+gap, cy, cx+arm, cy], fill=(r, g, b, 210), width=2)
+    draw.line([cx, cy-arm, cx, cy-gap], fill=(r, g, b, 210), width=2)
+    draw.line([cx, cy+gap, cx, cy+arm], fill=(r, g, b, 210), width=2)
+    # Ponto central branco
+    draw.ellipse([cx-3, cy-3, cx+3, cy+3], fill=(255, 255, 255, 255))
+    # Label da peça acima do marcador
+    if label:
+        texto = label.upper()
+        pad   = 5
+        tx    = cx - len(texto) * 4
+        ty    = cy - raio_base * 3 - 22
+        # Fundo do label
+        draw.rectangle(
+            [tx - pad, ty - pad, tx + len(texto) * 8 + pad, ty + 16 + pad],
+            fill=(r, g, b, 200),
+        )
+        draw.text((tx, ty), texto, fill=(255, 255, 255, 255))
 
-    w, h = pil_image.size
-    for box in boxes:
-        x0 = int(box["x_min"] * w)
-        y0 = int(box["y_min"] * h)
-        x1 = int(box["x_max"] * w)
-        y1 = int(box["y_max"] * h)
 
-        # Fundo semitransparente
-        draw.rectangle([x0, y0, x1, y1], fill=(239, 68, 68, 25))
-        # Borda
-        draw.rectangle([x0, y0, x1, y1], outline=(239, 68, 68, 220), width=3)
+# Mantém assinaturas antigas para compatibilidade interna
+def desenhar_marcador_ponto(pil_image, pontos):
+    pecas = [{"label": "dano", "pontos": pontos, "bboxes": [], "cor": CORES_MARCADORES[0]}]
+    return desenhar_marcadores_multi(pil_image, pecas)
 
-        # Marcador no centro da box como fallback
-        cx = (x0 + x1) // 2
-        cy = (y0 + y1) // 2
-        r = 8
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
-                     fill=(239, 68, 68, 200), outline=(255, 255, 255, 220), width=2)
 
-    resultado = Image.alpha_composite(img, overlay)
-    return resultado.convert("RGB")
+def desenhar_bounding_boxes(pil_image, boxes):
+    pecas = [{"label": "dano", "pontos": [], "bboxes": boxes, "cor": CORES_MARCADORES[0]}]
+    return desenhar_marcadores_multi(pil_image, pecas)
 
 
 def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
     """
-    Orquestra as chamadas à API Moondream e retorna um dicionário estruturado.
+    Analisa a imagem identificando TODAS as peças danificadas presentes,
+    não apenas a principal.
 
     Fluxo:
-        1. Identificar a peça automotiva principal
-        2. Pergunta binária YES/NO — ancora confiável para ha_dano
-        3. Se há dano: detalhar tipo, localização e severidade
-        4. Aplicar regras de negócio de severidade
-        5. Localizar o dano na imagem via /point (fallback /detect)
+        1. Perguntar quais peças com dano estão visíveis → lista
+        2. Para cada peça: confirmar dano (YES/NO) + tipo + localizar (/point)
+        3. Montar resultado consolidado com uma entrada por peça danificada
     """
     media_type = get_media_type(file_name)
     image_url  = image_to_base64(image_bytes, media_type)
 
-    # ── PASSO 1: Identificar a peça ──────────────────────────────────────────
-    resposta_peca = call_moondream_query(
+    # ── PASSO 1: Listar TODAS as peças danificadas na imagem ─────────────────
+    # Pergunta aberta que força o modelo a varrer toda a imagem
+    resposta_lista = call_moondream_query(
         image_url,
         (
-            "What is the main automotive part or component visible in this image? "
-            "Be specific and concise. Answer with just the part name in one or two words, "
-            "for example: windshield, headlight, bumper, door, mirror, hood, fender, tire."
+            "Look carefully at the entire image. "
+            "List ALL automotive parts that show ANY visible damage, scratch, dent, "
+            "crack, break, stain, or imperfection. "
+            "Reply ONLY with a comma-separated list of part names. "
+            "Example: bumper, taillight, door. "
+            "If nothing is damaged, reply: none."
         ),
         api_key,
     )
-    peca_identificada = inferir_peca(resposta_peca)
 
-    # ── PASSO 2: Pergunta binária — sinal principal para ha_dano ─────────────
-    # Esta é a âncora mais confiável. Resposta esperada: "YES" ou "NO".
-    # Não depende de parsing de frases longas, que é onde o erro ocorria antes.
-    resposta_binaria = call_moondream_query(
-        image_url,
-        (
-            f"Look very carefully at every part of this {peca_identificada} in the image. "
-            "Check for any scratch, scuff, mark, stain, dent, crack, paint chip, "
-            "discoloration, or any other imperfection — even subtle ones. "
-            "Is there ANY visible damage or imperfection present? "
-            "Answer with a single word: YES or NO."
-        ),
-        api_key,
-    )
-    # Determina ha_dano de forma binária e robusta — imune a variações de frase
-    ha_dano = resposta_binaria.strip().upper().startswith("YES")
+    # Parseia a lista de peças
+    pecas_raw = [p.strip().lower() for p in resposta_lista.split(",") if p.strip()]
+    pecas_raw = [p for p in pecas_raw if p not in ("none", "no damage", "nothing")]
 
-    # ── PASSO 3: Detalhar o dano (só se confirmado no passo 2) ──────────────
-    resposta_dano = ""
-    tipo_dano_raw = "none"
-    tipo_dano     = "sem dano"
-
-    if ha_dano:
-        resposta_dano = call_moondream_query(
+    # Fallback: se não retornou lista, identifica peça principal
+    if not pecas_raw:
+        peca_principal = call_moondream_query(
             image_url,
             (
-                f"There is visible damage on the {peca_identificada}. "
-                "Describe it precisely: "
-                "(1) What type of damage is it? (scratch, dent, crack, break, stain, etc.) "
-                "(2) Where exactly on the part is it located? "
-                "(3) How severe does it appear? "
-                "Be direct and specific."
+                "What is the main automotive part visible in this image? "
+                "Answer with just the part name in 1-2 words."
+            ),
+            api_key,
+        ).strip().lower()
+        pecas_raw = [peca_principal] if peca_principal else ["car part"]
+
+    # ── PASSO 2: Analisar cada peça individualmente ──────────────────────────
+    pecas_analisadas = []   # lista de dicts com info completa por peça
+
+    tipo_dano_map = {
+        "crack":       "trinca",
+        "scratch":     "arranhão",
+        "dent":        "amassado",
+        "break":       "quebra",
+        "broken":      "quebra",
+        "stain":       "mancha",
+        "deformation": "deformação",
+        "superficial": "dano superficial",
+        "none":        "sem dano",
+    }
+
+    for idx, peca in enumerate(pecas_raw[:5]):   # limita a 5 peças para não estourar rate limit
+        cor = CORES_MARCADORES[idx % len(CORES_MARCADORES)]
+
+        # 2a. Confirmar dano com pergunta binária
+        confirmacao = call_moondream_query(
+            image_url,
+            (
+                f"Focus only on the {peca}. "
+                "Is there visible damage, scratch, dent, crack, break or any imperfection on it? "
+                "Answer YES or NO only."
             ),
             api_key,
         )
+        ha_dano_peca = confirmacao.strip().upper().startswith("YES")
 
-        tipo_dano_raw = call_moondream_query(
+        if not ha_dano_peca:
+            continue   # pula peça sem dano confirmado
+
+        # 2b. Tipo de dano
+        tipo_raw = call_moondream_query(
             image_url,
             (
-                "Look at the damage visible in this image. "
-                "Reply with ONE word only — the damage type. "
-                "Choose exactly one: crack / scratch / dent / break / stain / superficial. "
-                "Do NOT explain. Just the one word."
+                f"What is the damage type on the {peca}? "
+                "Reply with ONE word only: crack / scratch / dent / break / stain / superficial."
             ),
             api_key,
-        )
+        ).strip().lower()
 
-        tipo_dano_map = {
-            "crack":       "trinca",
-            "scratch":     "arranhão",
-            "dent":        "amassado",
-            "break":       "quebra",
-            "stain":       "mancha",
-            "deformation": "deformação",
-            "superficial": "dano superficial",
-            "none":        "sem dano",
-        }
-        # Busca correspondência parcial para tolerar respostas como "scratches"
-        tipo_dano = "dano visível"  # fallback se nenhum match
+        tipo_dano = "dano visível"
         for key, valor in tipo_dano_map.items():
-            if key in tipo_dano_raw.lower():
+            if key in tipo_raw:
                 tipo_dano = valor
                 break
-    else:
-        # Pede descrição sucinta mesmo quando sem dano
-        resposta_dano = call_moondream_query(
+
+        # 2c. Descrição detalhada
+        descricao = call_moondream_query(
             image_url,
-            f"Briefly confirm the condition of the {peca_identificada} — no damage visible.",
+            (
+                f"Describe the damage on the {peca} in one sentence: "
+                "type, location on the part, and severity."
+            ),
             api_key,
         )
 
-    # ── PASSO 4: Regras de negócio — severidade ──────────────────────────────
-    severidade_texto, badge_class = inferir_severidade(
-        peca_identificada, tipo_dano, resposta_dano
-    )
+        # 2d. Severidade via regras de negócio
+        severidade_texto, badge_class = inferir_severidade(peca, tipo_dano, descricao)
 
-    # ── PASSO 5: Localização precisa do dano (/point → /detect como fallback) ─
-    pontos = []
-    bboxes = []
-
-    if ha_dano:
-        # Descrição específica aumenta a precisão do /point
-        objeto_busca = tipo_dano_raw.split()[0] if tipo_dano_raw != "none" else "damage"
-
-        # Tenta /point — retorna coordenada central exata do dano
-        pontos = call_moondream_point(image_url, objeto_busca, api_key)
-
+        # 2e. Localizar o dano via /point → fallback /detect
+        pontos = call_moondream_point(image_url, f"damage on {peca}", api_key)
         if not pontos:
-            pontos = call_moondream_point(image_url, "visible damage", api_key)
+            pontos = call_moondream_point(image_url, peca, api_key)
 
-        # Se /point falhar, fallback para /detect (bounding box)
+        bboxes = []
         if not pontos:
-            bboxes = call_moondream_detect(image_url, objeto_busca, api_key)
-
+            bboxes = call_moondream_detect(image_url, f"damaged {peca}", api_key)
         if not pontos and not bboxes:
-            bboxes = call_moondream_detect(image_url, "damage mark", api_key)
+            bboxes = call_moondream_detect(image_url, peca, api_key)
+
+        pecas_analisadas.append({
+            "peca":       peca,
+            "tipo_dano":  tipo_dano,
+            "severidade": severidade_texto,
+            "badge_class": badge_class,
+            "descricao":  descricao,
+            "pontos":     pontos,
+            "bboxes":     bboxes,
+            "cor":        cor,
+            "label":      peca,
+        })
+
+    # Se nenhuma peça passou pela confirmação, monta resultado "sem dano"
+    ha_dano_geral = len(pecas_analisadas) > 0
+
+    # Descrição consolidada
+    if ha_dano_geral:
+        desc_geral = "; ".join(
+            f"{p['peca']}: {p['tipo_dano']}" for p in pecas_analisadas
+        )
+    else:
+        desc_geral = "Nenhum dano visível foi identificado na imagem."
 
     return {
-        "peca":             peca_identificada,
-        "resposta_peca":    resposta_peca,
-        "resposta_binaria": resposta_binaria,
-        "ha_dano":          ha_dano,
-        "tipo_dano":        tipo_dano,
-        "severidade":       severidade_texto,
-        "badge_class":      badge_class,
-        "descricao":        resposta_dano,
-        "pontos":           pontos,
-        "bboxes":           bboxes,
+        "ha_dano":          ha_dano_geral,
+        "pecas_analisadas": pecas_analisadas,        # lista completa por peça
+        "descricao_geral":  desc_geral,
+        "lista_raw":        resposta_lista,
     }
 
 
@@ -682,78 +701,83 @@ if not resultado:
     st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RESULTADO — IMAGEM COM MARCAÇÃO PRECISA DO DANO
+# RESULTADO — IMAGEM COM MARCAÇÃO MULTI-PEÇA
 # ──────────────────────────────────────────────────────────────────────────────
-if resultado["pontos"] or resultado["bboxes"]:
-    st.subheader("📍 Localização do Dano")
+pecas = resultado.get("pecas_analisadas", [])
+tem_marcacoes = any(p["pontos"] or p["bboxes"] for p in pecas)
 
-    if resultado["pontos"]:
-        # Marcador de precisão via /point (crosshair + círculos)
-        imagem_anotada = desenhar_marcador_ponto(pil_image, resultado["pontos"])
-        st.image(imagem_anotada, caption="⊕ Ponto exato do dano identificado", use_container_width=True)
-    else:
-        # Fallback: bounding box via /detect
-        imagem_anotada = desenhar_bounding_boxes(pil_image, resultado["bboxes"])
-        st.image(imagem_anotada, caption="Região do dano identificada", use_container_width=True)
+if tem_marcacoes:
+    st.subheader("📍 Localização dos Danos")
+    imagem_anotada = desenhar_marcadores_multi(pil_image, pecas)
+    st.image(imagem_anotada, caption="⊕ Cada cor representa uma peça danificada", use_container_width=True)
+
+    # Legenda de cores
+    if len(pecas) > 1:
+        cols_leg = st.columns(len(pecas))
+        for i, peca_info in enumerate(pecas):
+            r, g, b = peca_info["cor"]
+            with cols_leg[i]:
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;gap:6px;'>"
+                    f"<div style='width:14px;height:14px;border-radius:50%;"
+                    f"background:rgb({r},{g},{b});flex-shrink:0;'></div>"
+                    f"<span style='font-size:0.78rem;color:#94a3b8;'>{peca_info['peca'].title()}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RESULTADO — CARDS VISUAIS
+# RESULTADO — CARDS POR PEÇA DANIFICADA
 # ──────────────────────────────────────────────────────────────────────────────
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.subheader("📋 Diagnóstico")
 
-col1, col2 = st.columns(2)
+if not resultado["ha_dano"]:
+    st.success("✅ **Nenhum dano visível identificado** na imagem analisada.")
+else:
+    st.markdown(
+        f"<p style='color:#64748b;font-size:0.88rem;margin-bottom:16px;'>"
+        f"🔍 {len(pecas)} peça(s) com dano identificada(s)</p>",
+        unsafe_allow_html=True,
+    )
 
-with col1:
-    st.markdown(f"""
-    <div class="result-card">
-        <div class="label">Peça Identificada</div>
-        <div class="value">🔧 {resultado['peca'].title()}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    for peca_info in pecas:
+        r, g, b  = peca_info["cor"]
+        badge    = peca_info["badge_class"]
+        sev      = peca_info["severidade"]
 
-with col2:
-    dano_icon  = "⚠️" if resultado["ha_dano"] else "✅"
-    dano_texto = "Dano detectado" if resultado["ha_dano"] else "Sem dano aparente"
-    st.markdown(f"""
-    <div class="result-card">
-        <div class="label">Status do Dano</div>
-        <div class="value">{dano_icon} {dano_texto}</div>
-    </div>
-    """, unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='result-card' style='border-left:4px solid rgb({r},{g},{b});'>",
+            unsafe_allow_html=True,
+        )
+        col1, col2, col3 = st.columns([2, 2, 2])
 
-if resultado["ha_dano"]:
-    col3, col4 = st.columns(2)
+        with col1:
+            st.markdown(
+                f"<div class='label'>Peça</div>"
+                f"<div class='value'>🔧 {peca_info['peca'].title()}</div>",
+                unsafe_allow_html=True,
+            )
+        with col2:
+            st.markdown(
+                f"<div class='label'>Tipo de Dano</div>"
+                f"<div class='value'>💥 {peca_info['tipo_dano'].title()}</div>",
+                unsafe_allow_html=True,
+            )
+        with col3:
+            st.markdown(
+                f"<div class='label'>Severidade</div>"
+                f"<div class='value'><span class='badge {badge}'>{sev}</span></div>",
+                unsafe_allow_html=True,
+            )
 
-    with col3:
-        st.markdown(f"""
-        <div class="result-card">
-            <div class="label">Tipo de Dano</div>
-            <div class="value">💥 {resultado['tipo_dano'].title()}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with col4:
-        badge = resultado["badge_class"]
-        sev   = resultado["severidade"]
-        st.markdown(f"""
-        <div class="result-card">
-            <div class="label">Severidade</div>
-            <div class="value">
-                <span class="badge {badge}">{sev}</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-# Descrição completa
-st.markdown(f"""
-<div class="result-card" style="margin-top: 4px;">
-    <div class="label">Descrição da Análise</div>
-    <div class="value" style="font-size: 0.95rem; font-weight: 400; line-height: 1.6; color: #cbd5e1;">
-        {resultado['descricao']}
-    </div>
-</div>
-""", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='margin-top:10px;font-size:0.88rem;color:#94a3b8;line-height:1.5;'>"
+            f"{peca_info['descricao']}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RESULTADO — JSON ESTRUTURADO
@@ -761,11 +785,17 @@ st.markdown(f"""
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
 json_saida = {
-    "peca":       resultado["peca"],
-    "ha_dano":    resultado["ha_dano"],
-    "tipo_dano":  resultado["tipo_dano"],
-    "severidade": resultado["severidade"],
-    "descricao":  resultado["descricao"],
+    "ha_dano": resultado["ha_dano"],
+    "total_pecas_danificadas": len(pecas),
+    "pecas": [
+        {
+            "peca":       p["peca"],
+            "tipo_dano":  p["tipo_dano"],
+            "severidade": p["severidade"],
+            "descricao":  p["descricao"],
+        }
+        for p in pecas
+    ],
 }
 
 with st.expander("🗂️  Ver saída JSON estruturada"):
