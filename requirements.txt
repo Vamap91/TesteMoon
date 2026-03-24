@@ -1,1 +1,6 @@
-streamlit
+# AutoVision — Dependências
+# Streamlit Community Cloud instala automaticamente ao fazer deploy.
+
+streamlit>=1.35.0
+requests>=2.31.0
+Pillow>=10.0.0
