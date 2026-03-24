@@ -437,9 +437,10 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
 
     Fluxo:
         1. Identificar a peça automotiva principal
-        2. Analisar existência e tipo de dano na peça
-        3. (Opcional) Detectar bounding box do dano
+        2. Pergunta binária YES/NO — ancora confiável para ha_dano
+        3. Se há dano: detalhar tipo, localização e severidade
         4. Aplicar regras de negócio de severidade
+        5. Localizar o dano na imagem via /point (fallback /detect)
     """
     media_type = get_media_type(file_name)
     image_url  = image_to_base64(image_bytes, media_type)
@@ -454,53 +455,80 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
         ),
         api_key,
     )
-
     peca_identificada = inferir_peca(resposta_peca)
 
-    # ── PASSO 2: Analisar o dano ─────────────────────────────────────────────
-    resposta_dano = call_moondream_query(
+    # ── PASSO 2: Pergunta binária — sinal principal para ha_dano ─────────────
+    # Esta é a âncora mais confiável. Resposta esperada: "YES" ou "NO".
+    # Não depende de parsing de frases longas, que é onde o erro ocorria antes.
+    resposta_binaria = call_moondream_query(
         image_url,
         (
-            f"Analyze the {peca_identificada} in this image. "
-            "Is there any visible damage? "
-            "If yes, describe: (1) the type of damage (crack, scratch, dent, break, etc.), "
-            "(2) where on the part the damage is located, "
-            "(3) how severe it appears. "
-            "If there is no visible damage, state that clearly. "
-            "Be direct and objective."
+            f"Look very carefully at every part of this {peca_identificada} in the image. "
+            "Check for any scratch, scuff, mark, stain, dent, crack, paint chip, "
+            "discoloration, or any other imperfection — even subtle ones. "
+            "Is there ANY visible damage or imperfection present? "
+            "Answer with a single word: YES or NO."
         ),
         api_key,
     )
+    # Determina ha_dano de forma binária e robusta — imune a variações de frase
+    ha_dano = resposta_binaria.strip().upper().startswith("YES")
 
-    # ── PASSO 3: Extrair tipo de dano ────────────────────────────────────────
-    tipo_dano_raw = call_moondream_query(
-        image_url,
-        (
-            "In one or two words only, what type of damage is visible? "
-            "Choose from: crack, scratch, dent, break, deformation, superficial, none. "
-            "If no damage, answer: none."
-        ),
-        api_key,
-    )
+    # ── PASSO 3: Detalhar o dano (só se confirmado no passo 2) ──────────────
+    resposta_dano = ""
+    tipo_dano_raw = "none"
+    tipo_dano     = "sem dano"
 
-    # Normaliza resposta do tipo de dano para PT-BR
-    tipo_dano_map = {
-        "crack": "trinca",
-        "scratch": "arranhão",
-        "dent": "amassado",
-        "break": "quebra",
-        "deformation": "deformação",
-        "superficial": "dano superficial",
-        "none": "sem dano",
-    }
-    tipo_dano = tipo_dano_map.get(tipo_dano_raw.lower().strip(), tipo_dano_raw)
+    if ha_dano:
+        resposta_dano = call_moondream_query(
+            image_url,
+            (
+                f"There is visible damage on the {peca_identificada}. "
+                "Describe it precisely: "
+                "(1) What type of damage is it? (scratch, dent, crack, break, stain, etc.) "
+                "(2) Where exactly on the part is it located? "
+                "(3) How severe does it appear? "
+                "Be direct and specific."
+            ),
+            api_key,
+        )
+
+        tipo_dano_raw = call_moondream_query(
+            image_url,
+            (
+                "Look at the damage visible in this image. "
+                "Reply with ONE word only — the damage type. "
+                "Choose exactly one: crack / scratch / dent / break / stain / superficial. "
+                "Do NOT explain. Just the one word."
+            ),
+            api_key,
+        )
+
+        tipo_dano_map = {
+            "crack":       "trinca",
+            "scratch":     "arranhão",
+            "dent":        "amassado",
+            "break":       "quebra",
+            "stain":       "mancha",
+            "deformation": "deformação",
+            "superficial": "dano superficial",
+            "none":        "sem dano",
+        }
+        # Busca correspondência parcial para tolerar respostas como "scratches"
+        tipo_dano = "dano visível"  # fallback se nenhum match
+        for key, valor in tipo_dano_map.items():
+            if key in tipo_dano_raw.lower():
+                tipo_dano = valor
+                break
+    else:
+        # Pede descrição sucinta mesmo quando sem dano
+        resposta_dano = call_moondream_query(
+            image_url,
+            f"Briefly confirm the condition of the {peca_identificada} — no damage visible.",
+            api_key,
+        )
 
     # ── PASSO 4: Regras de negócio — severidade ──────────────────────────────
-    ha_dano = "none" not in tipo_dano_raw.lower() and not any(
-        t in resposta_dano.lower()
-        for t in ["no damage", "sem dano", "nenhum dano", "not visible", "no visible damage"]
-    )
-
     severidade_texto, badge_class = inferir_severidade(
         peca_identificada, tipo_dano, resposta_dano
     )
@@ -510,27 +538,28 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
     bboxes = []
 
     if ha_dano:
-        # Monta descrição precisa do objeto a localizar
-        objeto_busca = f"{tipo_dano} on {peca_identificada}" if ha_dano else peca_identificada
+        # Descrição específica aumenta a precisão do /point
+        objeto_busca = tipo_dano_raw.split()[0] if tipo_dano_raw != "none" else "damage"
 
-        # Tenta /point primeiro — retorna coordenada central exata do dano
+        # Tenta /point — retorna coordenada central exata do dano
         pontos = call_moondream_point(image_url, objeto_busca, api_key)
 
-        # Se /point não encontrou, tenta /detect como fallback (bounding box)
         if not pontos:
-            pontos = call_moondream_point(image_url, "damage", api_key)
+            pontos = call_moondream_point(image_url, "visible damage", api_key)
 
+        # Se /point falhar, fallback para /detect (bounding box)
         if not pontos:
             bboxes = call_moondream_detect(image_url, objeto_busca, api_key)
 
-        if not bboxes and not pontos:
-            bboxes = call_moondream_detect(image_url, "damage", api_key)
+        if not pontos and not bboxes:
+            bboxes = call_moondream_detect(image_url, "damage mark", api_key)
 
     return {
         "peca":             peca_identificada,
         "resposta_peca":    resposta_peca,
+        "resposta_binaria": resposta_binaria,
         "ha_dano":          ha_dano,
-        "tipo_dano":        tipo_dano if ha_dano else "sem dano",
+        "tipo_dano":        tipo_dano,
         "severidade":       severidade_texto,
         "badge_class":      badge_class,
         "descricao":        resposta_dano,
