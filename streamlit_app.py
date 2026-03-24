@@ -11,7 +11,8 @@ import requests
 import base64
 import json
 import re
-from PIL import Image, ImageDraw
+import math
+from PIL import Image, ImageDraw, ImageFilter
 from io import BytesIO
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -155,6 +156,7 @@ st.markdown("""
 # ──────────────────────────────────────────────────────────────────────────────
 MOONDREAM_QUERY_URL  = "https://api.moondream.ai/v1/query"
 MOONDREAM_DETECT_URL = "https://api.moondream.ai/v1/detect"
+MOONDREAM_POINT_URL  = "https://api.moondream.ai/v1/point"
 
 PECAS_CONHECIDAS = [
     "para-brisa", "parabrisa", "windshield",
@@ -225,12 +227,36 @@ def call_moondream_query(image_url: str, question: str, api_key: str) -> str:
     return data.get("answer", "").strip()
 
 
+def call_moondream_point(image_url: str, object_name: str, api_key: str) -> list:
+    """
+    Chama o endpoint /point da API Moondream para obter as coordenadas centrais
+    exatas do objeto/dano na imagem.
+
+    Retorna lista de pontos: [{"x": 0.65, "y": 0.42}, ...]
+    Coordenadas normalizadas de 0 a 1.
+    Retorna lista vazia em caso de falha (não bloqueia o fluxo principal).
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "X-Moondream-Auth": api_key,
+    }
+    payload = {
+        "image_url": image_url,
+        "object":    object_name,
+    }
+    try:
+        response = requests.post(MOONDREAM_POINT_URL, headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        return response.json().get("points", [])
+    except Exception:
+        # /point é opcional — falha silenciosa para não quebrar o MVP
+        return []
+
+
 def call_moondream_detect(image_url: str, object_name: str, api_key: str) -> list:
     """
-    Chama o endpoint /detect da API Moondream para obter bounding boxes.
-
-    Retorna lista de objetos com x_min, y_min, x_max, y_max (valores de 0 a 1).
-    Retorna lista vazia em caso de falha (não bloqueia o fluxo principal).
+    Fallback: chama /detect para bounding box caso /point não retorne resultado.
+    Retorna lista de objetos com x_min, y_min, x_max, y_max (0 a 1).
     """
     headers = {
         "Content-Type": "application/json",
@@ -245,7 +271,6 @@ def call_moondream_detect(image_url: str, object_name: str, api_key: str) -> lis
         response.raise_for_status()
         return response.json().get("objects", [])
     except Exception:
-        # /detect é opcional — falha silenciosa para não quebrar o MVP
         return []
 
 
@@ -308,14 +333,80 @@ def inferir_severidade(peca: str, tipo_dano: str, descricao: str) -> tuple[str, 
     return "Média", "badge-media"
 
 
+def desenhar_marcador_ponto(pil_image: Image.Image, pontos: list) -> Image.Image:
+    """
+    Desenha marcadores de precisão (crosshair + círculos pulsantes) nos pontos
+    exatos do dano retornados pelo endpoint /point do Moondream.
+
+    Coordenadas normalizadas 0–1 → convertidas para pixels.
+    """
+    img = pil_image.copy().convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    w, h = pil_image.size
+    # Tamanho do marcador proporcional à imagem
+    raio_base = max(18, min(w, h) // 30)
+
+    for ponto in pontos:
+        cx = int(ponto["x"] * w)
+        cy = int(ponto["y"] * h)
+
+        # ── Círculo externo (halo) ──────────────────────────────────────────
+        r_ext = raio_base * 3
+        draw.ellipse(
+            [cx - r_ext, cy - r_ext, cx + r_ext, cy + r_ext],
+            outline=(239, 68, 68, 60),
+            width=2,
+        )
+
+        # ── Círculo médio ───────────────────────────────────────────────────
+        r_mid = raio_base * 2
+        draw.ellipse(
+            [cx - r_mid, cy - r_mid, cx + r_mid, cy + r_mid],
+            outline=(239, 68, 68, 140),
+            width=2,
+        )
+
+        # ── Círculo interno preenchido ──────────────────────────────────────
+        r_inn = raio_base
+        draw.ellipse(
+            [cx - r_inn, cy - r_inn, cx + r_inn, cy + r_inn],
+            fill=(239, 68, 68, 200),
+            outline=(255, 255, 255, 230),
+            width=2,
+        )
+
+        # ── Crosshair (cruz) ────────────────────────────────────────────────
+        arm = raio_base * 4
+        gap = raio_base + 4  # gap entre centro e início do traço
+
+        # Horizontal
+        draw.line([cx - arm, cy, cx - gap, cy], fill=(239, 68, 68, 220), width=2)
+        draw.line([cx + gap, cy, cx + arm, cy], fill=(239, 68, 68, 220), width=2)
+        # Vertical
+        draw.line([cx, cy - arm, cx, cy - gap], fill=(239, 68, 68, 220), width=2)
+        draw.line([cx, cy + gap, cx, cy + arm], fill=(239, 68, 68, 220), width=2)
+
+        # ── Ponto central branco ────────────────────────────────────────────
+        dot = 3
+        draw.ellipse(
+            [cx - dot, cy - dot, cx + dot, cy + dot],
+            fill=(255, 255, 255, 255),
+        )
+
+    resultado = Image.alpha_composite(img, overlay)
+    return resultado.convert("RGB")
+
+
 def desenhar_bounding_boxes(pil_image: Image.Image, boxes: list) -> Image.Image:
     """
-    Desenha bounding boxes normalizadas (0–1) sobre a imagem PIL.
-    Retorna uma nova imagem com as marcações.
+    Fallback: desenha bounding boxes quando /point não retorna coordenadas.
+    Também desenha o ponto central dentro de cada box.
     """
-    img_draw = pil_image.copy().convert("RGBA")
-    overlay  = Image.new("RGBA", img_draw.size, (0, 0, 0, 0))
-    draw     = ImageDraw.Draw(overlay)
+    img = pil_image.copy().convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
 
     w, h = pil_image.size
     for box in boxes:
@@ -323,11 +414,20 @@ def desenhar_bounding_boxes(pil_image: Image.Image, boxes: list) -> Image.Image:
         y0 = int(box["y_min"] * h)
         x1 = int(box["x_max"] * w)
         y1 = int(box["y_max"] * h)
-        # Retângulo semitransparente
-        draw.rectangle([x0, y0, x1, y1], outline=(239, 68, 68, 255), width=3)
-        draw.rectangle([x0, y0, x1, y1], fill=(239, 68, 68, 30))
 
-    resultado = Image.alpha_composite(img_draw, overlay)
+        # Fundo semitransparente
+        draw.rectangle([x0, y0, x1, y1], fill=(239, 68, 68, 25))
+        # Borda
+        draw.rectangle([x0, y0, x1, y1], outline=(239, 68, 68, 220), width=3)
+
+        # Marcador no centro da box como fallback
+        cx = (x0 + x1) // 2
+        cy = (y0 + y1) // 2
+        r = 8
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                     fill=(239, 68, 68, 200), outline=(255, 255, 255, 220), width=2)
+
+    resultado = Image.alpha_composite(img, overlay)
     return resultado.convert("RGB")
 
 
@@ -405,10 +505,26 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
         peca_identificada, tipo_dano, resposta_dano
     )
 
-    # ── PASSO 5: Bounding box (opcional) ────────────────────────────────────
+    # ── PASSO 5: Localização precisa do dano (/point → /detect como fallback) ─
+    pontos = []
     bboxes = []
+
     if ha_dano:
-        bboxes = call_moondream_detect(image_url, "damage", api_key)
+        # Monta descrição precisa do objeto a localizar
+        objeto_busca = f"{tipo_dano} on {peca_identificada}" if ha_dano else peca_identificada
+
+        # Tenta /point primeiro — retorna coordenada central exata do dano
+        pontos = call_moondream_point(image_url, objeto_busca, api_key)
+
+        # Se /point não encontrou, tenta /detect como fallback (bounding box)
+        if not pontos:
+            pontos = call_moondream_point(image_url, "damage", api_key)
+
+        if not pontos:
+            bboxes = call_moondream_detect(image_url, objeto_busca, api_key)
+
+        if not bboxes and not pontos:
+            bboxes = call_moondream_detect(image_url, "damage", api_key)
 
     return {
         "peca":             peca_identificada,
@@ -418,6 +534,7 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
         "severidade":       severidade_texto,
         "badge_class":      badge_class,
         "descricao":        resposta_dano,
+        "pontos":           pontos,
         "bboxes":           bboxes,
     }
 
@@ -536,12 +653,19 @@ if not resultado:
     st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RESULTADO — IMAGEM COM BOUNDING BOXES
+# RESULTADO — IMAGEM COM MARCAÇÃO PRECISA DO DANO
 # ──────────────────────────────────────────────────────────────────────────────
-if resultado["bboxes"]:
+if resultado["pontos"] or resultado["bboxes"]:
     st.subheader("📍 Localização do Dano")
-    imagem_anotada = desenhar_bounding_boxes(pil_image, resultado["bboxes"])
-    st.image(imagem_anotada, caption="Região do dano identificada", use_container_width=True)
+
+    if resultado["pontos"]:
+        # Marcador de precisão via /point (crosshair + círculos)
+        imagem_anotada = desenhar_marcador_ponto(pil_image, resultado["pontos"])
+        st.image(imagem_anotada, caption="⊕ Ponto exato do dano identificado", use_container_width=True)
+    else:
+        # Fallback: bounding box via /detect
+        imagem_anotada = desenhar_bounding_boxes(pil_image, resultado["bboxes"])
+        st.image(imagem_anotada, caption="Região do dano identificada", use_container_width=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RESULTADO — CARDS VISUAIS
