@@ -381,9 +381,12 @@ def desenhar_marcadores_multi(
             y0 = int(box["y_min"] * h)
             x1 = int(box["x_max"] * w)
             y1 = int(box["y_max"] * h)
-            draw.rectangle([x0, y0, x1, y1], fill=(r, g, b, 20))
-            draw.rectangle([x0, y0, x1, y1], outline=(r, g, b, 200), width=3)
-            # Ponto central na box
+
+            # Borda suave da bbox da PEÇA (mostra o contorno da peça)
+            draw.rectangle([x0, y0, x1, y1], fill=(r, g, b, 12))
+            draw.rectangle([x0, y0, x1, y1], outline=(r, g, b, 130), width=2)
+
+            # Crosshair preciso no CENTRO da bbox — cada peça tem posição única
             cx = (x0 + x1) // 2
             cy = (y0 + y1) // 2
             _desenhar_crosshair(draw, cx, cy, raio_base, r, g, b, label)
@@ -471,6 +474,35 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
     pecas_raw = [p.strip().lower() for p in resposta_lista.split(",") if p.strip()]
     pecas_raw = [p for p in pecas_raw if p not in ("none", "no damage", "nothing")]
 
+    # ── Deduplicação: remove peças repetidas e resolve sinônimos ─────────────
+    # Ex: "rear bumper" e "bumper" → mantém apenas a mais específica
+    SINONIMOS = {
+        "rear bumper":        "bumper",
+        "front bumper":       "bumper",
+        "tail light":         "taillight",
+        "tail lamp":          "taillight",
+        "rear light":         "taillight",
+        "rear lamp":          "taillight",
+        "head light":         "headlight",
+        "front light":        "headlight",
+        "rear door":          "door",
+        "front door":         "door",
+        "windscreen":         "windshield",
+        "front glass":        "windshield",
+        "side mirror":        "mirror",
+        "rearview mirror":    "mirror",
+        "bonnet":             "hood",
+        "wing":               "fender",
+    }
+    pecas_norm = []
+    vistas     = set()
+    for p in pecas_raw:
+        p_norm = SINONIMOS.get(p, p)
+        if p_norm not in vistas:
+            vistas.add(p_norm)
+            pecas_norm.append(p_norm)
+    pecas_raw = pecas_norm
+
     # Fallback: se não retornou lista, identifica peça principal
     if not pecas_raw:
         peca_principal = call_moondream_query(
@@ -545,27 +577,50 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
         # 2d. Severidade via regras de negócio
         severidade_texto, badge_class = inferir_severidade(peca, tipo_dano, descricao)
 
-        # 2e. Localizar o dano via /point → fallback /detect
-        pontos = call_moondream_point(image_url, f"damage on {peca}", api_key)
-        if not pontos:
+        # ── 2e. LOCALIZAÇÃO — estratégia: detectar a PEÇA, não o "dano" ────
+        #
+        # Problema com /point "damage on X": o modelo aponta sempre para o
+        # dano mais saliente da imagem inteira, ignorando qual peça pedimos.
+        #
+        # Solução: usar /detect na PEÇA em si → bbox única e precisa da peça.
+        # O marcador vai para o CENTRO da bbox → cada peça fica em seu lugar.
+        #
+        pontos = []
+        bboxes = call_moondream_detect(image_url, peca, api_key)
+
+        if not bboxes:
+            # Tenta variações de nome da peça
+            variantes = {
+                "taillight":    ["tail light", "rear light", "rear lamp"],
+                "headlight":    ["head light", "front light"],
+                "bumper":       ["rear bumper", "front bumper"],
+                "rear bumper":  ["bumper"],
+                "front bumper": ["bumper"],
+                "door":         ["car door"],
+                "rear door":    ["door"],
+                "windshield":   ["windscreen", "front glass"],
+                "hood":         ["bonnet"],
+                "fender":       ["wing"],
+            }
+            for variante in variantes.get(peca, []):
+                bboxes = call_moondream_detect(image_url, variante, api_key)
+                if bboxes:
+                    break
+
+        # Se /detect falhou completamente, usa /point como último recurso
+        if not bboxes:
             pontos = call_moondream_point(image_url, peca, api_key)
 
-        bboxes = []
-        if not pontos:
-            bboxes = call_moondream_detect(image_url, f"damaged {peca}", api_key)
-        if not pontos and not bboxes:
-            bboxes = call_moondream_detect(image_url, peca, api_key)
-
         pecas_analisadas.append({
-            "peca":       peca,
-            "tipo_dano":  tipo_dano,
-            "severidade": severidade_texto,
+            "peca":        peca,
+            "tipo_dano":   tipo_dano,
+            "severidade":  severidade_texto,
             "badge_class": badge_class,
-            "descricao":  descricao,
-            "pontos":     pontos,
-            "bboxes":     bboxes,
-            "cor":        cor,
-            "label":      peca,
+            "descricao":   descricao,
+            "pontos":      pontos,
+            "bboxes":      bboxes,
+            "cor":         cor,
+            "label":       peca,
         })
 
     # Se nenhuma peça passou pela confirmação, monta resultado "sem dano"
