@@ -335,100 +335,125 @@ def inferir_severidade(peca: str, tipo_dano: str, descricao: str) -> tuple[str, 
 
 # Paleta de cores para múltiplos marcadores — uma cor por peça danificada
 CORES_MARCADORES = [
-    (239, 68,  68),   # vermelho
-    (59,  130, 246),  # azul
-    (34,  197, 94),   # verde
-    (251, 191, 36),   # amarelo
-    (168, 85,  247),  # roxo
-    (20,  184, 166),  # teal
+    (239, 68,  68),   # 1 — vermelho
+    (59,  130, 246),  # 2 — azul
+    (34,  197, 94),   # 3 — verde
+    (251, 146, 36),   # 4 — laranja
+    (168, 85,  247),  # 5 — roxo
+    (20,  184, 166),  # 6 — teal
 ]
+
+
+def desenhar_pino_numerado(draw, cx, cy, numero: int, r: int, g: int, b: int, img_h: int):
+    """
+    Desenha um pino estilo mapa com número dentro, apontando para o dano.
+
+    Layout:
+        ┌────┐
+        │ N  │   ← bolha com número
+        └─┬──┘
+          │       ← haste
+          ▼       ← ponta no ponto exato do dano
+    """
+    # Dimensões proporcionais à imagem
+    raio   = max(18, img_h // 28)
+    haste  = raio + 4
+
+    # Ponta do pino fica exatamente em (cx, cy)
+    topo_y = cy - raio * 2 - haste
+
+    # ── Sombra suave ────────────────────────────────────────────────────────
+    shadow_off = 3
+    draw.ellipse(
+        [cx - raio + shadow_off, topo_y + shadow_off,
+         cx + raio + shadow_off, topo_y + raio * 2 + shadow_off],
+        fill=(0, 0, 0, 60),
+    )
+
+    # ── Círculo da bolha ─────────────────────────────────────────────────────
+    draw.ellipse(
+        [cx - raio, topo_y, cx + raio, topo_y + raio * 2],
+        fill=(r, g, b, 230),
+        outline=(255, 255, 255, 220),
+        width=2,
+    )
+
+    # ── Haste (triângulo apontando para baixo) ────────────────────────────────
+    centro_bolha_y = topo_y + raio * 2
+    draw.polygon(
+        [
+            (cx - raio // 3, centro_bolha_y - 2),
+            (cx + raio // 3, centro_bolha_y - 2),
+            (cx,             cy),
+        ],
+        fill=(r, g, b, 220),
+        outline=(255, 255, 255, 180),
+    )
+
+    # ── Ponto no local exato do dano ──────────────────────────────────────────
+    dot = max(4, raio // 4)
+    draw.ellipse(
+        [cx - dot, cy - dot, cx + dot, cy + dot],
+        fill=(255, 255, 255, 255),
+        outline=(r, g, b, 230),
+        width=2,
+    )
+
+    # ── Número dentro da bolha ────────────────────────────────────────────────
+    centro_x = cx
+    centro_y = topo_y + raio
+
+    # Tamanho da fonte aproximado (PIL sem fontes externas = 10px padrão)
+    font_size = max(10, raio - 4)
+    char      = str(numero)
+
+    # Offset manual para centralizar o dígito (sem PIL ImageFont)
+    offset_x = font_size // 4 if len(char) == 1 else font_size // 2
+    offset_y = font_size // 2
+
+    # Texto branco
+    draw.text(
+        (centro_x - offset_x, centro_y - offset_y),
+        char,
+        fill=(255, 255, 255, 255),
+    )
 
 
 def desenhar_marcadores_multi(
     pil_image: Image.Image,
-    pecas_danificadas: list,          # lista de dicts com "label", "pontos", "bboxes", "cor"
+    pecas_danificadas: list,
 ) -> Image.Image:
     """
-    Desenha marcadores de precisão para MÚLTIPLAS peças danificadas.
-    Cada peça recebe uma cor diferente com label identificando qual é.
+    Desenha pinos numerados sobre cada ponto de dano.
+    Cada número corresponde à peça listada no diagnóstico abaixo da imagem.
 
-    pecas_danificadas: [
-        {"label": "bumper", "pontos": [{"x":0.5,"y":0.7}], "bboxes": [], "cor": (R,G,B)},
-        ...
-    ]
+    pecas_danificadas: lista ordenada de dicts com "pontos", "bboxes", "cor"
     """
     img     = pil_image.copy().convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw    = ImageDraw.Draw(overlay)
 
-    w, h      = pil_image.size
-    raio_base = max(16, min(w, h) // 32)
+    w, h = pil_image.size
 
-    for peca in pecas_danificadas:
-        cor   = peca.get("cor", (239, 68, 68))
-        label = peca.get("label", "dano")
-        r, g, b = cor
+    for idx, peca in enumerate(pecas_danificadas):
+        numero  = idx + 1
+        r, g, b = peca.get("cor", CORES_MARCADORES[idx % len(CORES_MARCADORES)])
 
-        # ── Desenha por pontos (/point) ──────────────────────────────────────
-        for ponto in peca.get("pontos", []):
+        # Prefere /point (ponto exato); fallback: centro da bbox
+        pontos = peca.get("pontos", [])
+        if not pontos:
+            for box in peca.get("bboxes", []):
+                cx = (box["x_min"] + box["x_max"]) / 2
+                cy = (box["y_min"] + box["y_max"]) / 2
+                pontos.append({"x": cx, "y": cy})
+
+        for ponto in pontos:
             cx = int(ponto["x"] * w)
             cy = int(ponto["y"] * h)
-            _desenhar_crosshair(draw, cx, cy, raio_base, r, g, b, label)
-
-        # ── Fallback: bounding boxes (/detect) ───────────────────────────────
-        for box in peca.get("bboxes", []):
-            x0 = int(box["x_min"] * w)
-            y0 = int(box["y_min"] * h)
-            x1 = int(box["x_max"] * w)
-            y1 = int(box["y_max"] * h)
-
-            # Borda suave da bbox da PEÇA (mostra o contorno da peça)
-            draw.rectangle([x0, y0, x1, y1], fill=(r, g, b, 12))
-            draw.rectangle([x0, y0, x1, y1], outline=(r, g, b, 130), width=2)
-
-            # Crosshair preciso no CENTRO da bbox — cada peça tem posição única
-            cx = (x0 + x1) // 2
-            cy = (y0 + y1) // 2
-            _desenhar_crosshair(draw, cx, cy, raio_base, r, g, b, label)
+            desenhar_pino_numerado(draw, cx, cy, numero, r, g, b, h)
 
     resultado = Image.alpha_composite(img, overlay)
     return resultado.convert("RGB")
-
-
-def _desenhar_crosshair(draw, cx, cy, raio_base, r, g, b, label=""):
-    """Desenha crosshair + halo + label para um único ponto."""
-    # Halo externo
-    r_ext = raio_base * 3
-    draw.ellipse([cx-r_ext, cy-r_ext, cx+r_ext, cy+r_ext],
-                 outline=(r, g, b, 55), width=2)
-    # Círculo médio
-    r_mid = raio_base * 2
-    draw.ellipse([cx-r_mid, cy-r_mid, cx+r_mid, cy+r_mid],
-                 outline=(r, g, b, 130), width=2)
-    # Círculo interno preenchido
-    draw.ellipse([cx-raio_base, cy-raio_base, cx+raio_base, cy+raio_base],
-                 fill=(r, g, b, 190), outline=(255, 255, 255, 230), width=2)
-    # Crosshair
-    arm = raio_base * 4
-    gap = raio_base + 4
-    draw.line([cx-arm, cy, cx-gap, cy], fill=(r, g, b, 210), width=2)
-    draw.line([cx+gap, cy, cx+arm, cy], fill=(r, g, b, 210), width=2)
-    draw.line([cx, cy-arm, cx, cy-gap], fill=(r, g, b, 210), width=2)
-    draw.line([cx, cy+gap, cx, cy+arm], fill=(r, g, b, 210), width=2)
-    # Ponto central branco
-    draw.ellipse([cx-3, cy-3, cx+3, cy+3], fill=(255, 255, 255, 255))
-    # Label da peça acima do marcador
-    if label:
-        texto = label.upper()
-        pad   = 5
-        tx    = cx - len(texto) * 4
-        ty    = cy - raio_base * 3 - 22
-        # Fundo do label
-        draw.rectangle(
-            [tx - pad, ty - pad, tx + len(texto) * 8 + pad, ty + 16 + pad],
-            fill=(r, g, b, 200),
-        )
-        draw.text((tx, ty), texto, fill=(255, 255, 255, 255))
 
 
 # Mantém assinaturas antigas para compatibilidade interna
@@ -463,7 +488,7 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
             "Look carefully at the entire image. "
             "List ALL automotive parts that show ANY visible damage, scratch, dent, "
             "crack, break, stain, or imperfection. "
-            "Reply ONLY with a comma-separated list of part names. "
+            "Reply ONLY with a comma-separated list of part names in English. "
             "Example: bumper, taillight, door. "
             "If nothing is damaged, reply: none."
         ),
@@ -564,12 +589,13 @@ def analisar_imagem(image_bytes: bytes, file_name: str, api_key: str) -> dict:
                 tipo_dano = valor
                 break
 
-        # 2c. Descrição detalhada
+        # 2c. Descrição detalhada — forçada em PT-BR
         descricao = call_moondream_query(
             image_url,
             (
                 f"Describe the damage on the {peca} in one sentence: "
-                "type, location on the part, and severity."
+                "type, location on the part, and severity. "
+                "Respond in Brazilian Portuguese (pt-BR)."
             ),
             api_key,
         )
@@ -756,7 +782,7 @@ if not resultado:
     st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RESULTADO — IMAGEM COM MARCAÇÃO MULTI-PEÇA
+# RESULTADO — IMAGEM COM PINOS NUMERADOS
 # ──────────────────────────────────────────────────────────────────────────────
 pecas = resultado.get("pecas_analisadas", [])
 tem_marcacoes = any(p["pontos"] or p["bboxes"] for p in pecas)
@@ -764,22 +790,7 @@ tem_marcacoes = any(p["pontos"] or p["bboxes"] for p in pecas)
 if tem_marcacoes:
     st.subheader("📍 Localização dos Danos")
     imagem_anotada = desenhar_marcadores_multi(pil_image, pecas)
-    st.image(imagem_anotada, caption="⊕ Cada cor representa uma peça danificada", use_container_width=True)
-
-    # Legenda de cores
-    if len(pecas) > 1:
-        cols_leg = st.columns(len(pecas))
-        for i, peca_info in enumerate(pecas):
-            r, g, b = peca_info["cor"]
-            with cols_leg[i]:
-                st.markdown(
-                    f"<div style='display:flex;align-items:center;gap:6px;'>"
-                    f"<div style='width:14px;height:14px;border-radius:50%;"
-                    f"background:rgb({r},{g},{b});flex-shrink:0;'></div>"
-                    f"<span style='font-size:0.78rem;color:#94a3b8;'>{peca_info['peca'].title()}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
+    st.image(imagem_anotada, caption="Os números na imagem correspondem às peças no diagnóstico abaixo", use_container_width=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RESULTADO — CARDS POR PEÇA DANIFICADA
@@ -796,43 +807,53 @@ else:
         unsafe_allow_html=True,
     )
 
-    for peca_info in pecas:
+    for idx, peca_info in enumerate(pecas):
+        numero   = idx + 1
         r, g, b  = peca_info["cor"]
         badge    = peca_info["badge_class"]
         sev      = peca_info["severidade"]
 
-        st.markdown(
-            f"<div class='result-card' style='border-left:4px solid rgb({r},{g},{b});'>",
-            unsafe_allow_html=True,
-        )
-        col1, col2, col3 = st.columns([2, 2, 2])
+        # Tradução do nome da peça para PT-BR (melhor UX)
+        NOMES_PTBR = {
+            "bumper": "Para-choque", "taillight": "Lanterna traseira",
+            "headlight": "Farol", "door": "Porta", "hood": "Capô",
+            "fender": "Paralama", "windshield": "Para-brisa",
+            "mirror": "Retrovisor", "roof": "Teto", "trunk": "Porta-malas",
+            "wheel": "Roda", "tire": "Pneu", "glass": "Vidro",
+            "rear quarter panel": "Painel traseiro", "quarter panel": "Painel lateral",
+            "pillar": "Pilar", "grille": "Grade dianteira",
+        }
+        nome_ptbr = NOMES_PTBR.get(peca_info["peca"].lower(), peca_info["peca"].title())
 
-        with col1:
-            st.markdown(
-                f"<div class='label'>Peça</div>"
-                f"<div class='value'>🔧 {peca_info['peca'].title()}</div>",
-                unsafe_allow_html=True,
-            )
-        with col2:
-            st.markdown(
-                f"<div class='label'>Tipo de Dano</div>"
-                f"<div class='value'>💥 {peca_info['tipo_dano'].title()}</div>",
-                unsafe_allow_html=True,
-            )
-        with col3:
-            st.markdown(
-                f"<div class='label'>Severidade</div>"
-                f"<div class='value'><span class='badge {badge}'>{sev}</span></div>",
-                unsafe_allow_html=True,
-            )
-
-        st.markdown(
-            f"<div style='margin-top:10px;font-size:0.88rem;color:#94a3b8;line-height:1.5;'>"
-            f"{peca_info['descricao']}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="result-card" style="border-left: 4px solid rgb({r},{g},{b}); padding-left: 18px;">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+                <div style="
+                    width:28px; height:28px; border-radius:50% 50% 50% 0;
+                    transform: rotate(-45deg);
+                    background: rgb({r},{g},{b});
+                    display:flex; align-items:center; justify-content:center;
+                    flex-shrink:0; box-shadow: 0 2px 6px rgba({r},{g},{b},0.5);
+                ">
+                    <span style="transform:rotate(45deg); color:white; font-weight:700; font-size:0.8rem;">
+                        {numero}
+                    </span>
+                </div>
+                <span style="font-size:1.05rem; font-weight:600; color:#f1f5f9;">{nome_ptbr}</span>
+                <span class="badge {badge}" style="margin-left:auto;">{sev}</span>
+            </div>
+            <div style="display:flex; gap:24px; margin-bottom:10px;">
+                <div>
+                    <div class="label">Tipo de Dano</div>
+                    <div class="value" style="font-size:0.95rem;">💥 {peca_info['tipo_dano'].title()}</div>
+                </div>
+            </div>
+            <div style="font-size:0.88rem; color:#94a3b8; line-height:1.5; border-top:1px solid #1e2536; padding-top:10px;">
+                {peca_info['descricao']}
+            </div>
+        </div>
+        <div style="height:8px"></div>
+        """, unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RESULTADO — JSON ESTRUTURADO
@@ -844,12 +865,13 @@ json_saida = {
     "total_pecas_danificadas": len(pecas),
     "pecas": [
         {
+            "numero":     i + 1,
             "peca":       p["peca"],
             "tipo_dano":  p["tipo_dano"],
             "severidade": p["severidade"],
             "descricao":  p["descricao"],
         }
-        for p in pecas
+        for i, p in enumerate(pecas)
     ],
 }
 
